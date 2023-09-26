@@ -1,0 +1,13 @@
+[package]
+name = "apollonia-course-bots"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+axum = "0.6.20"
+dotenv = "0.15.0"
+futures = "0.3.28"
+teloxide = { version = "0.12.2", features = ["webhooks-axum", "macros", "webhooks"] }
+tokio = { version = "1.32.0", features = ["macros", "rt-multi-thread"] }
