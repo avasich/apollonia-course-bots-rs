@@ -34,8 +34,14 @@ enum Command {
 async fn start(bot: Bot, msg: Message, dialogue: MyDialogue) -> HandlerResult {
     let text = msg.text().unwrap_or("");
 
-    bot.send_message(msg.chat.id, format!("start({text})"))
-        .await?;
+    let id = bot.get_me().await?.id;
+    let token = bot.token();
+
+    bot.send_message(
+        msg.chat.id,
+        format!("start({text})\nbot id: {id}\nbot token: {token}"),
+    )
+    .await?;
     Ok(())
 }
 

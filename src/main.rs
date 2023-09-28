@@ -1,8 +1,7 @@
-use std::{fmt::Debug, net::SocketAddr, vec};
-
 use axum::Router;
 use dotenv::dotenv;
 use futures::future::BoxFuture;
+use std::{fmt::Debug, hash::Hash, net::SocketAddr, vec};
 use teloxide::{
     dispatching::{dialogue::InMemStorage, DefaultKey, UpdateHandler},
     prelude::*,
@@ -10,7 +9,7 @@ use teloxide::{
     update_listeners::{webhooks, UpdateListener},
     Bot,
 };
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::handlers::{schema, State};
 
@@ -36,11 +35,14 @@ async fn main() {
                 token.to_owned(),
                 create_dispatcher(schema(), Some(dptree::deps![InMemStorage::<State>::new()])),
             )
-            .await;
+            .await
+            .map_err(|(bot_id, err)| {
+                println!("bot {bot_id} not started: {err}");
+            });
     }
 
-    let (_, bots_handles) = builder.build();
-    futures::future::join_all(bots_handles).await;
+    let (_, mut bots_handles) = builder.build();
+    while (bots_handles.join_next().await).is_some() {}
 }
 
 fn create_dispatcher<Err>(
@@ -62,7 +64,7 @@ struct BotServerBuilder {
     addr: SocketAddr,
     router: Router,
     stop_tokens: Vec<StopToken>,
-    stop_flags: JoinSet<()>,
+    stop_flags: Vec<BoxFuture<'static, ()>>,
     bots_listeners: Vec<BoxFuture<'static, ()>>,
 }
 
@@ -73,34 +75,41 @@ impl BotServerBuilder {
             addr,
             router: Router::new(),
             stop_tokens: vec![],
-            stop_flags: JoinSet::new(),
+            stop_flags: vec![],
             bots_listeners: vec![],
         }
     }
 
-    async fn add_bot<Err>(
+    async fn add_bot<Err, Key>(
         &mut self,
         token: String,
-        make_dispatcher: impl FnOnce(Bot) -> Dispatcher<Bot, Err, DefaultKey> + Send + 'static,
-    ) -> Result<(), <Bot as Requester>::Err>
+        make_dispatcher: impl FnOnce(Bot) -> Dispatcher<Bot, Err, Key> + Send + 'static,
+    ) -> Result<(), (String, <Bot as Requester>::Err)>
     where
-        Err: Debug + Send + Sync + 'static,
+        Err: Send + Sync + 'static,
+        Key: Send + Hash + Eq + Clone,
     {
         let bot = Bot::new(&token);
-        let url = format!("{}/{}", self.host, token).parse().unwrap();
+        let bot_id = token
+            .split(':')
+            .next()
+            .expect("wrong bot token format")
+            .to_owned();
+        let url = format!("{}/bot/{}", self.host, bot_id).parse().unwrap();
 
         let (mut listener, stop_flag, router) =
-            webhooks::axum_to_router(bot.clone(), webhooks::Options::new(self.addr, url)).await?;
+            webhooks::axum_to_router(bot.clone(), webhooks::Options::new(self.addr, url))
+                .await
+                .map_err(|e| (bot_id, e))?;
 
-        let old_router = std::mem::take(&mut self.router);
-        self.router = old_router.merge(router);
+        self.router = router.merge(std::mem::take(&mut self.router));
 
         let stop_token = listener.stop_token();
         self.stop_tokens.push(stop_token);
-        self.stop_flags.spawn(stop_flag);
+        self.stop_flags.push(Box::pin(stop_flag));
 
         let dispatcher_handle = async move {
-            make_dispatcher(bot.clone())
+            make_dispatcher(bot)
                 .dispatch_with_listener(
                     listener,
                     LoggingErrorHandler::with_custom_text(
@@ -113,37 +122,32 @@ impl BotServerBuilder {
         Ok(())
     }
 
-    fn build(
-        self,
-    ) -> (
-        tokio::task::JoinHandle<()>,
-        Vec<tokio::task::JoinHandle<()>>,
-    ) {
+    fn build(self) -> (JoinHandle<()>, JoinSet<()>) {
         let Self {
             stop_tokens,
-            mut stop_flags,
             bots_listeners,
             router,
             addr,
             ..
         } = self;
 
-        let stop_flag = async move { if (stop_flags.join_next().await).is_some() {} };
-
         let server_handle = tokio::spawn(async move {
             axum::Server::bind(&addr)
                 .serve(router.into_make_service())
-                .with_graceful_shutdown(stop_flag)
+                // .with_graceful_shutdown(stop_flag)
                 .await
                 .map_err(|err| {
-                    stop_tokens.iter().for_each(|t| t.stop());
+                    stop_tokens.iter().for_each(StopToken::stop);
                     err
                 })
                 .expect("Axum server error");
         });
 
-        let bots_handles: Vec<_> = bots_listeners.into_iter().map(tokio::spawn).collect();
+        let mut bots_tasks = JoinSet::new();
+        for listener in bots_listeners {
+            bots_tasks.spawn(listener);
+        }
 
-        (server_handle, bots_handles)
+        (server_handle, bots_tasks)
     }
 }

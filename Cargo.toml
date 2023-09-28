@@ -11,3 +11,4 @@ dotenv = "0.15.0"
 futures = "0.3.28"
 teloxide = { version = "0.12.2", features = ["webhooks-axum", "macros", "webhooks"] }
 tokio = { version = "1.32.0", features = ["macros", "rt-multi-thread"] }
+url = "2.4.1"
