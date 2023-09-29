@@ -6,9 +6,12 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.75"
 axum = "0.6.20"
 dotenv = "0.15.0"
 futures = "0.3.28"
+log = "0.4.20"
+pretty_env_logger = "0.5.0"
 teloxide = { version = "0.12.2", features = ["webhooks-axum", "macros", "webhooks"] }
 tokio = { version = "1.32.0", features = ["macros", "rt-multi-thread"] }
 url = "2.4.1"

@@ -1,7 +1,7 @@
-use axum::Router;
-use dotenv::dotenv;
-use futures::future::BoxFuture;
 use std::{fmt::Debug, hash::Hash, net::SocketAddr, vec};
+
+use axum::Router;
+use futures::future::BoxFuture;
 use teloxide::{
     dispatching::{dialogue::InMemStorage, DefaultKey, UpdateHandler},
     prelude::*,
@@ -11,20 +11,31 @@ use teloxide::{
 };
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::handlers::{schema, State};
+use crate::{
+    error::AddBotError,
+    handlers::{schema, State},
+};
 
+mod error;
 mod handlers;
 
 #[tokio::main]
 async fn main() {
-    dotenv().ok();
+    dotenv::dotenv().ok();
+    pretty_env_logger::init();
 
-    let tokens = std::env::var("BOT_TOKENS").expect("BOT_TOKENS is not set");
-    let host = std::env::var("BOT_HOST").expect("BOT_HOST is not set");
+    let tokens = std::env::var("BOT_TOKENS")
+        .map_err(|e| log::error!("BOT_TOKENS: {e}"))
+        .unwrap();
+    let host = std::env::var("BOT_HOST")
+        .map_err(|e| log::error!("BOT_TOKENS: {e}"))
+        .unwrap();
     let port: u16 = std::env::var("PORT")
-        .expect("PORT is not set")
+        .map_err(|e| log::error!("PORT: {e}"))
+        .unwrap()
         .parse()
-        .expect("cannot parse PORT");
+        .map_err(|e| log::error!("PORT: {e}"))
+        .unwrap();
     let addr = ([127, 0, 0, 1], port).into();
 
     let mut builder = BotServerBuilder::new(host, addr);
@@ -36,9 +47,8 @@ async fn main() {
                 create_dispatcher(schema(), Some(dptree::deps![InMemStorage::<State>::new()])),
             )
             .await
-            .map_err(|(bot_id, err)| {
-                println!("bot {bot_id} not started: {err}");
-            });
+            .map(|id| log::info!("webhook for bot {id} set up"))
+            .map_err(|e| log::error!("bot is not started: {e}"));
     }
 
     let (_, mut bots_handles) = builder.build();
@@ -84,23 +94,26 @@ impl BotServerBuilder {
         &mut self,
         token: String,
         make_dispatcher: impl FnOnce(Bot) -> Dispatcher<Bot, Err, Key> + Send + 'static,
-    ) -> Result<(), (String, <Bot as Requester>::Err)>
+    ) -> Result<String, AddBotError>
     where
         Err: Send + Sync + 'static,
         Key: Send + Hash + Eq + Clone,
     {
         let bot = Bot::new(&token);
+
         let bot_id = token
             .split(':')
             .next()
-            .expect("wrong bot token format")
-            .to_owned();
-        let url = format!("{}/bot/{}", self.host, bot_id).parse().unwrap();
+            .ok_or_else(|| AddBotError::IdParse(token.clone()))?;
+
+        let url = format!("{}/bot/{}", self.host, bot_id)
+            .parse()
+            .map_err(|e| AddBotError::UrlParse((bot_id, e).into()))?;
 
         let (mut listener, stop_flag, router) =
             webhooks::axum_to_router(bot.clone(), webhooks::Options::new(self.addr, url))
                 .await
-                .map_err(|e| (bot_id, e))?;
+                .map_err(|e| AddBotError::Listener((bot_id, e).into()))?;
 
         self.router = router.merge(std::mem::take(&mut self.router));
 
@@ -108,18 +121,21 @@ impl BotServerBuilder {
         self.stop_tokens.push(stop_token);
         self.stop_flags.push(Box::pin(stop_flag));
 
+        let bot_id_owned = bot_id.to_string();
         let dispatcher_handle = async move {
+            log::info!("listening webhook for bot {bot_id_owned}");
             make_dispatcher(bot)
                 .dispatch_with_listener(
                     listener,
-                    LoggingErrorHandler::with_custom_text(
-                        "main::An error from the update listener",
-                    ),
+                    LoggingErrorHandler::with_custom_text(format!(
+                        "bot {} listener error",
+                        bot_id_owned
+                    )),
                 )
                 .await;
         };
         self.bots_listeners.push(Box::pin(dispatcher_handle));
-        Ok(())
+        Ok(bot_id.into())
     }
 
     fn build(self) -> (JoinHandle<()>, JoinSet<()>) {
@@ -132,15 +148,15 @@ impl BotServerBuilder {
         } = self;
 
         let server_handle = tokio::spawn(async move {
-            axum::Server::bind(&addr)
+            let _ = axum::Server::bind(&addr)
                 .serve(router.into_make_service())
                 // .with_graceful_shutdown(stop_flag)
                 .await
-                .map_err(|err| {
+                .map(|_| log::info!("axum server started"))
+                .map_err(|e| {
+                    log::error!("axum server error: {e}, stopping bots");
                     stop_tokens.iter().for_each(StopToken::stop);
-                    err
-                })
-                .expect("Axum server error");
+                });
         });
 
         let mut bots_tasks = JoinSet::new();
